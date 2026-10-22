@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Green Screen</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="stage"></canvas>
+  <div id="overlay">
+    <h1>Green Screen</h1>
+    <button id="start" type="button">Start</button>
+    <p id="error" role="alert" hidden></p>
+    <p class="note">Your camera stays on this phone. Nothing is uploaded.</p>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
