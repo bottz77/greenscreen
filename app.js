@@ -1,5 +1,5 @@
 'use strict';
-const APP_VERSION = 'v4';
+const APP_VERSION = 'v5';
 // Step 1: camera -> canvas draw loop. Later: segmentation inside processFrame().
 // Video never leaves the device: no network calls with frames.
 (function () {
@@ -114,11 +114,20 @@ const APP_VERSION = 'v4';
     });
   }
 
+  // Visible part of the source (normalized), so it covers the screen with no bars.
+  let crop = { x: 0, y: 0, w: 1, h: 1 };
+  function updateCrop(w, h) {
+    const sz = srcSize(), sa = sz[0] / sz[1], da = w / h;
+    crop = sa > da ? { x: (1 - da / sa) / 2, y: 0, w: da / sa, h: 1 } : { x: 0, y: (1 - sa / da) / 2, w: 1, h: sa / da };
+  }
+
+  // Always mirrored (front or back camera): the TV acts like a mirror.
   function drawMirrored(c, src, w, h) {
+    const sw = src.videoWidth || src.naturalWidth || src.width, sh = src.videoHeight || src.naturalHeight || src.height;
     c.save();
     c.translate(w, 0);
-    c.scale(-1, 1); // mirror like a selfie
-    c.drawImage(src, 0, 0, w, h);
+    c.scale(-1, 1);
+    c.drawImage(src, crop.x * sw, crop.y * sh, crop.w * sw, crop.h * sh, 0, 0, w, h);
     c.restore();
   }
 
@@ -162,11 +171,11 @@ const APP_VERSION = 'v4';
       maskData = maskCtx.createImageData(mw, mh);
     }
     const d = maskData.data;
-    let sum = 0, mn = 1, mx = 0;
+    let sum = 0, mn = 1, mx = 0, sumX = 0;
     for (let i = 0; i < conf.length; i++) {
       let c = conf[i];
       c = c > 1 ? 1 : (c > 0 ? c : 0); // clamp (also turns NaN into 0)
-      sum += c; if (c < mn) mn = c; if (c > mx) mx = c;
+      sum += c; sumX += c * (i % mw); if (c < mn) mn = c; if (c > mx) mx = c;
       const j = i * 4;
       d[j] = d[j + 1] = d[j + 2] = 255;
       d[j + 3] = c * 255;
@@ -174,6 +183,12 @@ const APP_VERSION = 'v4';
     result.close();
     maskCtx.putImageData(maskData, 0, 0);
     updateStats(mw, mh, sum / conf.length, mn, mx);
+    // Player position on screen (mirrored, 0 = left edge of TV, 1 = right).
+    const present = sum / conf.length > 0.04;
+    const cxSrc = sum > 0 ? sumX / sum / mw : 0.5;
+    const px = Math.min(1, Math.max(0, 1 - (cxSrc - crop.x) / crop.w));
+    const now = performance.now();
+    window.Game.update(now, present, px);
 
     if (DEBUG) { // raw mask: white = person, black = background
       ctx.globalCompositeOperation = 'source-over';
@@ -195,7 +210,9 @@ const APP_VERSION = 'v4';
     // Main canvas: background, then person on top.
     ctx.globalCompositeOperation = 'source-over';
     drawBackground(w, h);
+    window.Game.drawBehind(ctx, w, h);
     ctx.drawImage(personCanvas, 0, 0);
+    window.Game.drawFront(ctx, w, h, now);
   }
 
   function updateStats(mw, mh, mean, mn, mx) {
@@ -204,17 +221,21 @@ const APP_VERSION = 'v4';
     stats.min = Math.min(stats.min, mn); stats.max = Math.max(stats.max, mx);
     const now = performance.now();
     if (now - stats.t < 1000) return;
+    if (!DEBUG) { stats = { n: 0, sum: 0, min: 1, max: 0, t: now, mw: mw, mh: mh, frames: 0 }; return; }
+    const gi = window.Game.info();
     versionEl.textContent = APP_VERSION + ' · ' + delegateUsed + ' · mask ' + mw + 'x' + mh +
       ' · mean ' + (stats.sum / stats.n).toFixed(2) + ' [' + stats.min.toFixed(2) + '–' + stats.max.toFixed(2) + ']' +
-      ' · ' + Math.round(stats.frames * 1000 / (now - stats.t || 1)) + 'fps' + (DEBUG ? ' · debug' : '');
+      ' · ' + Math.round(stats.frames * 1000 / (now - stats.t || 1)) + 'fps' + ' · ' + gi.state + ' lane ' + gi.lane + ' x ' + gi.sx.toFixed(2);
     stats = { n: 0, sum: 0, min: 1, max: 0, t: now, mw: mw, mh: mh, frames: 0 };
   }
 
   function loop() {
     const ready = source === video ? video.readyState >= 2 : source.complete;
     if (ready) {
-      const sz = srcSize();
-      if (canvas.width !== sz[0] || canvas.height !== sz[1]) { canvas.width = sz[0]; canvas.height = sz[1]; }
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const cw = Math.round(window.innerWidth * dpr), ch = Math.round(window.innerHeight * dpr);
+      if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
+      updateCrop(cw, ch);
       processFrame();
     }
     requestAnimationFrame(loop);
@@ -225,7 +246,7 @@ const APP_VERSION = 'v4';
     try {
       segmenter = await loadSegmenter();
       statusEl.hidden = true;
-      versionEl.textContent = APP_VERSION + ' · ' + delegateUsed;
+      if (DEBUG) versionEl.textContent = APP_VERSION + ' · ' + delegateUsed;
     } catch (e) {
       console.error(e);
       setStatus('Could not load the cut-out model: ' + (e && e.message ? e.message : e), true);
@@ -247,7 +268,7 @@ const APP_VERSION = 'v4';
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+        video: { facingMode: params.get('cam') === 'back' ? 'environment' : 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
       });
       video.srcObject = stream;
       await video.play();
@@ -259,6 +280,17 @@ const APP_VERSION = 'v4';
       showError(explain(err));
     }
   }
+
+  // Testing helpers: ?testlane=0|1|2 or arrow keys force the lane (Down = back to body tracking).
+  if (params.has('testlane')) window.Game.setForcedLane(Number(params.get('testlane')));
+  window.addEventListener('keydown', function (e) {
+    const cur = window.Game.getForcedLane() === null ? window.Game.info().lane : window.Game.getForcedLane();
+    if (e.key === 'ArrowLeft') window.Game.setForcedLane(Math.max(0, cur - 1));
+    if (e.key === 'ArrowRight') window.Game.setForcedLane(Math.min(2, cur + 1));
+    if (e.key === 'ArrowDown') window.Game.setForcedLane(null);
+    if (e.key === ' ' || e.key === 'Enter') window.Game.tap(performance.now());
+  });
+  canvas.addEventListener('click', function () { window.Game.tap(performance.now()); });
 
   startBtn.addEventListener('click', function () {
     const testImg = params.get('testimg');
