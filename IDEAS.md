@@ -8,3 +8,5 @@
 ## Tech notes
 - Exercises and lane controls will need body pose tracking: MediaPipe **Pose Landmarker** (on-device, alongside the selfie segmenter).
 - Keep all camera processing on the phone; never upload footage.
+
+- Milestones, achievements, and power-ups
