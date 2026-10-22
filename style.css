@@ -8,3 +8,6 @@ html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-f
 .note { opacity: .7; font-size: .9rem; }
 #status { position: fixed; top: max(1rem, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); background: rgba(0,0,0,.65); padding: .4rem 1rem; border-radius: 999px; font-size: .9rem; }
 #status[hidden] { display: none; }
+#status.error { background: rgba(185,28,28,.9); max-width: 90vw; }
+#version { position: fixed; right: .5rem; bottom: max(.5rem, env(safe-area-inset-bottom)); font-size: .75rem; opacity: .8; background: rgba(0,0,0,.5); padding: .1rem .5rem; border-radius: 6px; z-index: 10; }
+#status { z-index: 10; }

@@ -1,4 +1,5 @@
 'use strict';
+const APP_VERSION = 'v3';
 // Step 1: camera -> canvas draw loop. Later: segmentation inside processFrame().
 // Video never leaves the device: no network calls with frames.
 (function () {
@@ -9,6 +10,12 @@
   const startBtn = document.getElementById('start');
   const errorEl = document.getElementById('error');
   const statusEl = document.getElementById('status');
+  const versionEl = document.getElementById('version');
+  versionEl.textContent = APP_VERSION;
+  window.addEventListener('error', function (e) { setStatus('Error: ' + e.message, true); });
+  window.addEventListener('unhandledrejection', function (e) {
+    setStatus('Error: ' + (e.reason && e.reason.message ? e.reason.message : e.reason), true);
+  });
 
   function showError(msg) {
     errorEl.textContent = msg;
@@ -49,6 +56,14 @@
   const personCanvas = document.createElement('canvas');
   const personCtx = personCanvas.getContext('2d');
   let maskData = null;
+  let delegateUsed = '';
+  let frameError = null;
+
+  function setStatus(msg, isError) {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle('error', !!isError);
+    statusEl.hidden = false;
+  }
 
   async function loadSegmenter() {
     const vision = await import(MP_URL + '/vision_bundle.mjs');
@@ -59,10 +74,17 @@
       outputConfidenceMasks: true,
       outputCategoryMask: false
     });
+    // WebKit (all iOS browsers) is unreliable with the GPU delegate; use CPU there.
+    const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const isWebKit = isIOS || (/AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg/.test(navigator.userAgent));
+    if (isWebKit) { delegateUsed = 'CPU'; return await make('CPU'); }
     try {
+      delegateUsed = 'GPU';
       return await make('GPU');
     } catch (e) {
       console.warn('GPU delegate failed, using CPU', e);
+      delegateUsed = 'CPU';
       return await make('CPU');
     }
   }
@@ -102,10 +124,21 @@
 
   function processFrame() {
     const w = canvas.width, h = canvas.height;
-    if (!segmenter) { drawMirrored(ctx, video, w, h); return; }
+    if (!segmenter || frameError) { drawMirrored(ctx, video, w, h); return; }
+    try {
+      compositeFrame(w, h);
+    } catch (e) {
+      frameError = e;
+      console.error(e);
+      setStatus('Cut-out failed (' + delegateUsed + '): ' + (e && e.message ? e.message : e), true);
+      drawMirrored(ctx, video, w, h);
+    }
+  }
+
+  function compositeFrame(w, h) {
     const result = segmenter.segmentForVideo(video, performance.now());
     const mask = result.confidenceMasks && result.confidenceMasks[0];
-    if (!mask) { drawMirrored(ctx, video, w, h); return; }
+    if (!mask) { result.close(); throw new Error('model returned no mask'); }
     const mw = mask.width, mh = mask.height;
     const conf = mask.getAsFloat32Array();
     if (maskCanvas.width !== mw || maskCanvas.height !== mh || !maskData) {
@@ -157,13 +190,14 @@
       resize();
       overlay.classList.add('hidden');
       requestAnimationFrame(loop);
-      statusEl.hidden = false;
+      setStatus('Loading model…');
       try {
         segmenter = await loadSegmenter();
         statusEl.hidden = true;
+        versionEl.textContent = APP_VERSION + ' · ' + delegateUsed;
       } catch (e) {
-        statusEl.textContent = 'Could not load the cut-out model. Check your connection and reload.';
         console.error(e);
+        setStatus('Could not load the cut-out model: ' + (e && e.message ? e.message : e), true);
       }
     } catch (err) {
       showError(explain(err));
