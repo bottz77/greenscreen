@@ -1,5 +1,5 @@
 'use strict';
-const APP_VERSION = 'v3';
+const APP_VERSION = 'v4';
 // Step 1: camera -> canvas draw loop. Later: segmentation inside processFrame().
 // Video never leaves the device: no network calls with frames.
 (function () {
@@ -122,23 +122,39 @@ const APP_VERSION = 'v3';
     c.restore();
   }
 
+  const params = new URLSearchParams(location.search);
+  const DEBUG = params.get('debug') === '1';
+  // Small canvas the model reads from (more portable on iOS than passing <video>).
+  const inCanvas = document.createElement('canvas');
+  const inCtx = inCanvas.getContext('2d', { willReadFrequently: true });
+  let source = video; // ?testimg=URL swaps in a still image (testing only)
+  let stats = { n: 0, sum: 0, min: 1, max: 0, t: 0, mw: 0, mh: 0, frames: 0 };
+
+  function srcSize() {
+    return source === video ? [video.videoWidth, video.videoHeight] : [source.naturalWidth, source.naturalHeight];
+  }
+
   function processFrame() {
     const w = canvas.width, h = canvas.height;
-    if (!segmenter || frameError) { drawMirrored(ctx, video, w, h); return; }
+    if (!segmenter || frameError) { drawMirrored(ctx, source, w, h); return; }
     try {
       compositeFrame(w, h);
     } catch (e) {
       frameError = e;
       console.error(e);
       setStatus('Cut-out failed (' + delegateUsed + '): ' + (e && e.message ? e.message : e), true);
-      drawMirrored(ctx, video, w, h);
+      drawMirrored(ctx, source, w, h);
     }
   }
 
   function compositeFrame(w, h) {
-    const result = segmenter.segmentForVideo(video, performance.now());
-    const mask = result.confidenceMasks && result.confidenceMasks[0];
-    if (!mask) { result.close(); throw new Error('model returned no mask'); }
+    const sz = srcSize();
+    const iw = 256, ih = Math.max(1, Math.round(256 * sz[1] / sz[0]));
+    if (inCanvas.width !== iw || inCanvas.height !== ih) { inCanvas.width = iw; inCanvas.height = ih; }
+    inCtx.drawImage(source, 0, 0, iw, ih);
+    const result = segmenter.segmentForVideo(inCanvas, performance.now());
+    const mask = result && result.confidenceMasks && result.confidenceMasks[0];
+    if (!mask) { if (result) result.close(); throw new Error('model returned no mask'); }
     const mw = mask.width, mh = mask.height;
     const conf = mask.getAsFloat32Array();
     if (maskCanvas.width !== mw || maskCanvas.height !== mh || !maskData) {
@@ -146,26 +162,74 @@ const APP_VERSION = 'v3';
       maskData = maskCtx.createImageData(mw, mh);
     }
     const d = maskData.data;
-    for (let i = 0; i < conf.length; i++) d[i * 4 + 3] = conf[i] * 255;
+    let sum = 0, mn = 1, mx = 0;
+    for (let i = 0; i < conf.length; i++) {
+      let c = conf[i];
+      c = c > 1 ? 1 : (c > 0 ? c : 0); // clamp (also turns NaN into 0)
+      sum += c; if (c < mn) mn = c; if (c > mx) mx = c;
+      const j = i * 4;
+      d[j] = d[j + 1] = d[j + 2] = 255;
+      d[j + 3] = c * 255;
+    }
     result.close();
     maskCtx.putImageData(maskData, 0, 0);
+    updateStats(mw, mh, sum / conf.length, mn, mx);
+
+    if (DEBUG) { // raw mask: white = person, black = background
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, w, h);
+      drawMirrored(ctx, maskCanvas, w, h);
+      return;
+    }
     if (personCanvas.width !== w || personCanvas.height !== h) {
       personCanvas.width = w; personCanvas.height = h;
     }
-    personCtx.globalCompositeOperation = 'copy';
+    // Person layer: clear, draw camera, keep only where the mask is opaque.
+    personCtx.globalCompositeOperation = 'source-over';
+    personCtx.clearRect(0, 0, w, h);
+    drawMirrored(personCtx, source, w, h);
+    personCtx.globalCompositeOperation = 'destination-in';
     drawMirrored(personCtx, maskCanvas, w, h);
-    personCtx.globalCompositeOperation = 'source-in';
-    drawMirrored(personCtx, video, w, h);
+    personCtx.globalCompositeOperation = 'source-over';
+    // Main canvas: background, then person on top.
+    ctx.globalCompositeOperation = 'source-over';
     drawBackground(w, h);
     ctx.drawImage(personCanvas, 0, 0);
   }
 
+  function updateStats(mw, mh, mean, mn, mx) {
+    stats.frames++;
+    stats.sum += mean; stats.n++;
+    stats.min = Math.min(stats.min, mn); stats.max = Math.max(stats.max, mx);
+    const now = performance.now();
+    if (now - stats.t < 1000) return;
+    versionEl.textContent = APP_VERSION + ' · ' + delegateUsed + ' · mask ' + mw + 'x' + mh +
+      ' · mean ' + (stats.sum / stats.n).toFixed(2) + ' [' + stats.min.toFixed(2) + '–' + stats.max.toFixed(2) + ']' +
+      ' · ' + Math.round(stats.frames * 1000 / (now - stats.t || 1)) + 'fps' + (DEBUG ? ' · debug' : '');
+    stats = { n: 0, sum: 0, min: 1, max: 0, t: now, mw: mw, mh: mh, frames: 0 };
+  }
+
   function loop() {
-    if (video.readyState >= 2) {
-      if (canvas.width !== video.videoWidth) resize();
+    const ready = source === video ? video.readyState >= 2 : source.complete;
+    if (ready) {
+      const sz = srcSize();
+      if (canvas.width !== sz[0] || canvas.height !== sz[1]) { canvas.width = sz[0]; canvas.height = sz[1]; }
       processFrame();
     }
     requestAnimationFrame(loop);
+  }
+
+  async function startModel() {
+    setStatus('Loading model…');
+    try {
+      segmenter = await loadSegmenter();
+      statusEl.hidden = true;
+      versionEl.textContent = APP_VERSION + ' · ' + delegateUsed;
+    } catch (e) {
+      console.error(e);
+      setStatus('Could not load the cut-out model: ' + (e && e.message ? e.message : e), true);
+    }
   }
 
   async function start() {
@@ -190,19 +254,19 @@ const APP_VERSION = 'v3';
       resize();
       overlay.classList.add('hidden');
       requestAnimationFrame(loop);
-      setStatus('Loading model…');
-      try {
-        segmenter = await loadSegmenter();
-        statusEl.hidden = true;
-        versionEl.textContent = APP_VERSION + ' · ' + delegateUsed;
-      } catch (e) {
-        console.error(e);
-        setStatus('Could not load the cut-out model: ' + (e && e.message ? e.message : e), true);
-      }
+      await startModel();
     } catch (err) {
       showError(explain(err));
     }
   }
 
-  startBtn.addEventListener('click', start);
+  startBtn.addEventListener('click', function () {
+    const testImg = params.get('testimg');
+    if (!testImg) { start(); return; }
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = function () { source = img; overlay.classList.add('hidden'); requestAnimationFrame(loop); startModel(); };
+    img.onerror = function () { showError('Could not load test image.'); };
+    img.src = testImg;
+  });
 })();
