@@ -1,5 +1,5 @@
 'use strict';
-const APP_VERSION = 'v5';
+const APP_VERSION = 'v6';
 // Step 1: camera -> canvas draw loop. Later: segmentation inside processFrame().
 // Video never leaves the device: no network calls with frames.
 (function () {
@@ -49,7 +49,13 @@ const APP_VERSION = 'v5';
   // --- Step 2: on-device person segmentation (MediaPipe ImageSegmenter) ---
   const MP_VER = '1.1.1';
   const MP_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@' + MP_VER;
-  const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite';
+  const Q = new URLSearchParams(location.search);
+  // Landscape model is smaller/faster (144x256 input); ?model=general for the square one.
+  const MODEL_URL = Q.get('model') === 'general'
+    ? 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite'
+    : 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite';
+  const IN_W = Number(Q.get('inw')) || 192; // model input width (px)
+  const FULL_CANVAS = Q.get('canvas') === 'full';
   let segmenter = null;
   const maskCanvas = document.createElement('canvas');
   const maskCtx = maskCanvas.getContext('2d');
@@ -158,10 +164,11 @@ const APP_VERSION = 'v5';
 
   function compositeFrame(w, h) {
     const sz = srcSize();
-    const iw = 256, ih = Math.max(1, Math.round(256 * sz[1] / sz[0]));
+    const iw = IN_W, ih = Math.max(1, Math.round(IN_W * sz[1] / sz[0]));
     if (inCanvas.width !== iw || inCanvas.height !== ih) { inCanvas.width = iw; inCanvas.height = ih; }
     inCtx.drawImage(source, 0, 0, iw, ih);
-    const result = segmenter.segmentForVideo(inCanvas, performance.now());
+    const segStart = performance.now();
+    const result = segmenter.segmentForVideo(inCanvas, segStart);
     const mask = result && result.confidenceMasks && result.confidenceMasks[0];
     if (!mask) { if (result) result.close(); throw new Error('model returned no mask'); }
     const mw = mask.width, mh = mask.height;
@@ -169,6 +176,7 @@ const APP_VERSION = 'v5';
     if (maskCanvas.width !== mw || maskCanvas.height !== mh || !maskData) {
       maskCanvas.width = mw; maskCanvas.height = mh;
       maskData = maskCtx.createImageData(mw, mh);
+      maskData.data.fill(255); // RGB stays white; only alpha changes per frame
     }
     const d = maskData.data;
     let sum = 0, mn = 1, mx = 0, sumX = 0;
@@ -176,11 +184,10 @@ const APP_VERSION = 'v5';
       let c = conf[i];
       c = c > 1 ? 1 : (c > 0 ? c : 0); // clamp (also turns NaN into 0)
       sum += c; sumX += c * (i % mw); if (c < mn) mn = c; if (c > mx) mx = c;
-      const j = i * 4;
-      d[j] = d[j + 1] = d[j + 2] = 255;
-      d[j + 3] = c * 255;
+      d[i * 4 + 3] = c * 255;
     }
     result.close();
+    segMs += performance.now() - segStart;
     maskCtx.putImageData(maskData, 0, 0);
     updateStats(mw, mh, sum / conf.length, mn, mx);
     // Player position on screen (mirrored, 0 = left edge of TV, 1 = right).
@@ -215,6 +222,7 @@ const APP_VERSION = 'v5';
     window.Game.drawFront(ctx, w, h, now);
   }
 
+  let segMs = 0;
   function updateStats(mw, mh, mean, mn, mx) {
     stats.frames++;
     stats.sum += mean; stats.n++;
@@ -223,17 +231,24 @@ const APP_VERSION = 'v5';
     if (now - stats.t < 1000) return;
     if (!DEBUG) { stats = { n: 0, sum: 0, min: 1, max: 0, t: now, mw: mw, mh: mh, frames: 0 }; return; }
     const gi = window.Game.info();
+    const fps = stats.frames * 1000 / (now - stats.t || 1), seg = segMs / (stats.frames || 1);
+    // Estimated input->lane delay: camera frame age (~1 frame @30fps) + segmentation
+    // + frames the smoothing needs to cross a lane line (see Game.framesToSwitch).
+    const latency = 33 + seg + window.Game.framesToSwitch() * 1000 / (fps || 1);
+    segMs = 0;
     versionEl.textContent = APP_VERSION + ' · ' + delegateUsed + ' · mask ' + mw + 'x' + mh +
       ' · mean ' + (stats.sum / stats.n).toFixed(2) + ' [' + stats.min.toFixed(2) + '–' + stats.max.toFixed(2) + ']' +
-      ' · ' + Math.round(stats.frames * 1000 / (now - stats.t || 1)) + 'fps' + ' · ' + gi.state + ' lane ' + gi.lane + ' x ' + gi.sx.toFixed(2);
+      ' · ' + Math.round(fps) + 'fps · seg ' + seg.toFixed(1) + 'ms · lane~' + Math.round(latency) + 'ms · ' + canvas.width + 'x' + canvas.height + ' · ' + gi.state + ' lane ' + gi.lane + ' x ' + gi.sx.toFixed(2);
     stats = { n: 0, sum: 0, min: 1, max: 0, t: now, mw: mw, mh: mh, frames: 0 };
   }
 
   function loop() {
     const ready = source === video ? video.readyState >= 2 : source.complete;
     if (ready) {
+      // Internal resolution capped near 960x540; CSS scales it to fill the screen.
       const dpr = Math.min(2, window.devicePixelRatio || 1);
-      const cw = Math.round(window.innerWidth * dpr), ch = Math.round(window.innerHeight * dpr);
+      const k = FULL_CANVAS ? dpr : Math.min(dpr, 960 / Math.max(window.innerWidth, window.innerHeight), 540 / Math.min(window.innerWidth, window.innerHeight));
+      const cw = Math.round(window.innerWidth * k), ch = Math.round(window.innerHeight * k);
       if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
       updateCrop(cw, ch);
       processFrame();
@@ -268,7 +283,7 @@ const APP_VERSION = 'v5';
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: params.get('cam') === 'back' ? 'environment' : 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+        video: { facingMode: params.get('cam') === 'back' ? 'environment' : 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }
       });
       video.srcObject = stream;
       await video.play();
@@ -300,5 +315,6 @@ const APP_VERSION = 'v5';
     img.onload = function () { source = img; overlay.classList.add('hidden'); requestAnimationFrame(loop); startModel(); };
     img.onerror = function () { showError('Could not load test image.'); };
     img.src = testImg;
+    if (DEBUG) window.__gsSetTestImage = function (url) { img.src = url; }; // latency testing
   });
 })();

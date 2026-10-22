@@ -6,6 +6,12 @@ window.Game = (function () {
   let state = 'wait', t0 = 0, last = 0, lives = LIVES, score = 0, elapsed = 0;
   let obstacles = [], nextSpawn = 0, presentSince = 0, flashUntil = 0;
   let lane = 1, sx = 0.5, forcedLane = null;
+  const ALPHA = 0.6, MARGIN = 0.03; // v6: lighter smoothing, narrower hysteresis (was 0.35 / 0.05)
+  // Frames needed to switch lane when the body jumps from a lane centre (0.5) to the next (1/6).
+  function framesToSwitch() {
+    const from = 0.5, to = 1 / 6, thr = 1 / 3 - MARGIN;
+    return Math.ceil(Math.log((thr - to) / (from - to)) / Math.log(1 - ALPHA));
+  }
 
   // Track geometry: p = 0 at horizon, 1 at bottom of screen.
   function edges(w, p) {
@@ -17,8 +23,8 @@ window.Game = (function () {
   function laneX(w, p, i) { const e = edges(w, p); return e[0] + (e[1] - e[0]) * (i + 0.5) / 3; }
 
   function updateLane(x) {
-    sx += (x - sx) * 0.35;
-    const m = 0.05; // hysteresis margin
+    sx += (x - sx) * ALPHA;
+    const m = MARGIN; // hysteresis margin
     if (lane === 0 && sx > 1 / 3 + m) lane = 1;
     if (lane === 2 && sx < 2 / 3 - m) lane = 1;
     if (lane === 1 && sx < 1 / 3 - m) lane = 0;
@@ -53,7 +59,9 @@ window.Game = (function () {
           if (o.lane === lane) { lives--; o.hit = true; flashUntil = now + 400; } else score++;
         }
       });
-      obstacles = obstacles.filter(function (o) { return o.z < 1.15; });
+      let n = 0; // compact in place (no per-frame array allocation)
+      for (let i = 0; i < obstacles.length; i++) if (obstacles[i].z < 1.15) obstacles[n++] = obstacles[i];
+      obstacles.length = n;
       if (lives <= 0) { state = 'over'; t0 = now; }
     }
   }
@@ -70,7 +78,7 @@ window.Game = (function () {
 
   // Obstacles still behind the player (drawn before the person cut-out).
   function drawBehind(ctx, w, h) {
-    obstacles.filter(function (o) { return o.z < PLAYER_P; }).forEach(function (o) { drawObstacle(ctx, w, h, o); });
+    for (let i = 0; i < obstacles.length; i++) if (obstacles[i].z < PLAYER_P) drawObstacle(ctx, w, h, obstacles[i]);
   }
 
   function text(ctx, s, x, y, size, align) {
@@ -81,7 +89,7 @@ window.Game = (function () {
   }
 
   function drawFront(ctx, w, h, now) {
-    obstacles.filter(function (o) { return o.z >= PLAYER_P; }).forEach(function (o) { drawObstacle(ctx, w, h, o); });
+    for (let i = 0; i < obstacles.length; i++) if (obstacles[i].z >= PLAYER_P) drawObstacle(ctx, w, h, obstacles[i]);
     if (now < flashUntil) { ctx.fillStyle = 'rgba(239,68,68,.35)'; ctx.fillRect(0, 0, w, h); }
     const s = Math.min(w, h * 1.6);
     ctx.textBaseline = 'middle';
@@ -108,5 +116,5 @@ window.Game = (function () {
   function getForcedLane() { return forcedLane; }
   function info() { return { state: state, lane: lane, score: score, lives: lives, obstacles: obstacles.length, sx: sx }; }
 
-  return { update: update, drawBehind: drawBehind, drawFront: drawFront, tap: tap, setForcedLane: setForcedLane, getForcedLane: getForcedLane, info: info };
+  return { update: update, drawBehind: drawBehind, drawFront: drawFront, tap: tap, setForcedLane: setForcedLane, getForcedLane: getForcedLane, info: info, framesToSwitch: framesToSwitch };
 })();
